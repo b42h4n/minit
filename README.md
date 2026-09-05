@@ -2,7 +2,7 @@
 
 <p>
   <img src="https://img.shields.io/badge/C-99-A8B9CC?style=for-the-badge&logo=c&logoColor=white" alt="C99"/>
-  <img src="https://img.shields.io/badge/LINUX-KERNEL%20%2B-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux"/>
+  <img src="https://img.shields.io/badge/LINUX-4.4%20%2B-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux"/>
   <img src="https://img.shields.io/badge/PID-1-0A66C2?style=for-the-badge&logo=linuxcontainers&logoColor=white" alt="PID 1"/>
   <img src="https://img.shields.io/badge/SIZE-MINIMAL-CC3333?style=for-the-badge&logo=speedtest&logoColor=white" alt="Minimal"/>
   <img src="https://img.shields.io/badge/LICENSE-GPL3.0-8A2BE2?style=for-the-badge&logo=opensourceinitiative&logoColor=white" alt="License GPL"/>
