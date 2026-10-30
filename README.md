@@ -32,22 +32,22 @@ No build system required: two translation units, so a direct compiler invocation
 ### Dynamic build
 
 ```bash
-gcc -O2 -Wall -o minit minit.c
-gcc -O2 -Wall -o minitctl minitctl.c
+gcc -O2 -Wall -o src/minit minit.c
+gcc -O2 -Wall -o src/minitctl minitctl.c
 ```
 
 ### Static build
 
 ```bash
-gcc -static -O2 -Wall -o minit minit.c
-gcc -static -O2 -Wall -o minitctl minitctl.c
+gcc -static -O2 -Wall -o src/minit minit.c
+gcc -static -O2 -Wall -o src/minitctl minitctl.c
 ```
 
 For a truly static binary with no runtime NSS/dlopen surprises, build against musl instead of glibc:
 
 ```bash
-musl-gcc -static -O2 -o minit minit.c
-musl-gcc -static -O2 -o minitctl minitctl.c
+musl-gcc -static -O2 -o src/minit minit.c
+musl-gcc -static -O2 -o src/minitctl minitctl.c
 ```
 
 Strip them down for size if needed:
