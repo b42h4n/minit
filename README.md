@@ -45,28 +45,28 @@ No build system required: two translation units, so a direct compiler invocation
 ### Dynamic build
 
 ```bash
-gcc -O2 -Wall -o minit src/minit.c
-gcc -O2 -Wall -o minitctl src/minitctl.c
+gcc -O2 -Wall -o build/minit src/minit.c
+gcc -O2 -Wall -o build/minitctl src/minitctl.c
 ```
 
 ### Static build
 
 ```bash
-gcc -static -O2 -Wall -o minit src/minit.c
-gcc -static -O2 -Wall -o minitctl src/minitctl.c
+gcc -static -O2 -Wall -o build/minit src/minit.c
+gcc -static -O2 -Wall -o build/minitctl src/minitctl.c
 ```
 
 For a truly static binary with no runtime NSS/dlopen surprises, build against musl instead of glibc:
 
 ```bash
-musl-gcc -static -O2 -o minit src/minit.c
-musl-gcc -static -O2 -o minitctl src/minitctl.c
+musl-gcc -static -O2 -o build/minit src/minit.c
+musl-gcc -static -O2 -o build/minitctl src/minitctl.c
 ```
 
 Strip them down for size if needed:
 
 ```bash
-strip --strip-all minit minitctl
+strip --strip-all build/minit build/minitctl
 ```
 
 Paths (config file, socket, log directory, cgroup root) are defined in `src/minit.h` and can be overridden at compile time, e.g. `-DCONF_PATH='"/etc/my.conf"'`.
@@ -200,4 +200,4 @@ This project is licensed under the GPL v3.0 License. See the [LICENSE](./LICENSE
 
 ---
 
-If you run into any issues or have questions, please open an issue in this repository.
+If you run into any issues or have questions, please open an issue in this repository. 
