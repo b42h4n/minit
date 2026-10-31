@@ -45,22 +45,22 @@ No build system required: two translation units, so a direct compiler invocation
 ### Dynamic build
 
 ```bash
-gcc -O2 -Wall -o src/minit minit.c
-gcc -O2 -Wall -o src/minitctl minitctl.c
+gcc -O2 -Wall -o minit src/minit.c
+gcc -O2 -Wall -o minitctl src/minitctl.c
 ```
 
 ### Static build
 
 ```bash
-gcc -static -O2 -Wall -o minit minit.c
-gcc -static -O2 -Wall -o minitctl minitctl.c
+gcc -static -O2 -Wall -o minit src/minit.c
+gcc -static -O2 -Wall -o minitctl src/minitctl.c
 ```
 
 For a truly static binary with no runtime NSS/dlopen surprises, build against musl instead of glibc:
 
 ```bash
-musl-gcc -static -O2 -o minit minit.c
-musl-gcc -static -O2 -o minitctl minitctl.c
+musl-gcc -static -O2 -o minit src/minit.c
+musl-gcc -static -O2 -o minitctl src/minitctl.c
 ```
 
 Strip them down for size if needed:
@@ -126,7 +126,7 @@ Logs are never rotated or truncated. Point `/var/log` at a `tmpfs` if the root f
 ## minitctl
 
 ```
-minitctl status <name>
+minitctl status [name]
 minitctl start   <name>
 minitctl stop    <name>
 minitctl restart <name>
