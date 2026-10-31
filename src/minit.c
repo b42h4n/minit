@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -23,6 +24,8 @@
 
 #define MAX_SVC          64
 #define RESTART_DELAY_MS 1000
+#define DEFAULT_STOP_MS  5000
+#define KILL_RETRY_MS    1000
 #define DEFAULT_PATH     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 typedef enum { ST_STOPPED, ST_RUNNING, ST_BACKOFF, ST_FAILED } state_t;
@@ -40,6 +43,11 @@ typedef struct {
     int last_status;
     long long restart_at;
     long long started;
+    int stop_timeout_ms;
+    long long kill_at;      
+    int sigkilled;
+    long long sigkill_at;
+    int kill_retries;
 } svc_t;
 
 static svc_t svcs[MAX_SVC];
@@ -55,6 +63,7 @@ static void panic(const char *fmt, ...) {
     fputc('\n', stderr);
     fflush(stderr);
     sync();
+    // panicing
     exit(1);
 }
 
@@ -84,7 +93,7 @@ static void mount_dev(void) {
             perror("minit: mount tmpfs on /dev");
             return;
         }
-        // Without devtmpfs, kernel doesn't create device nodes, init MUST create a minimal set ourselves.
+        
         mknod_safe("/dev/null",    S_IFCHR | 0666, 1, 3);
         mknod_safe("/dev/zero",    S_IFCHR | 0666, 1, 5);
         mknod_safe("/dev/full",    S_IFCHR | 0666, 1, 7);
@@ -110,7 +119,6 @@ static void mount_dev(void) {
     symlink_safe("/proc/self/fd/1", "/dev/stdout");
     symlink_safe("/proc/self/fd/2", "/dev/stderr");
 
-    // if the kernel hasnt provided stdio, bind it to the console
     if (fcntl(0, F_GETFD) < 0) {
         int c = open("/dev/console", O_RDWR);
         if (c >= 0) {
@@ -168,7 +176,8 @@ static void fmt_status(char *out, size_t sz, int st) {
     else                     snprintf(out, sz, "?");
 }
 
-//config
+// config
+
 static char **tokenize(char *line, int *argc_out) {
     char **argv = NULL;
     int argc = 0;
@@ -201,6 +210,7 @@ static void load_config(void) {
     char line[512];
     int lineno = 0;
     int default_restarts = 0;
+    int default_stop_ms = DEFAULT_STOP_MS;
 
     while (fgets(line, sizeof line, f)) {
         lineno++;
@@ -220,6 +230,21 @@ static void load_config(void) {
                 if (end == q || *end || v < 0 || v > 1000000)
                     panic("%s:%d: bad restarts value", CONF_PATH, lineno);
                 default_restarts = (int)v;
+                continue;
+            }
+        }
+
+        if (strncmp(p, "stop_timeout", 12) == 0) {
+            char *q = p + 12;
+            while (isspace((unsigned char)*q)) q++;
+            if (*q == '=') {
+                q++;
+                char *end;
+                long v = strtol(q, &end, 10);
+                while (isspace((unsigned char)*end)) end++;
+                if (end == q || *end || v < 0 || v > 86400)
+                    panic("%s:%d: bad stop_timeout value (seconds)", CONF_PATH, lineno);
+                default_stop_ms = (int)v * 1000;
                 continue;
             }
         }
@@ -253,13 +278,14 @@ static void load_config(void) {
         snprintf(s->name, sizeof s->name, "%s", uniq);
         s->argv = argv;
         s->max_restarts = default_restarts;
+        s->stop_timeout_ms = default_stop_ms;
         s->last_status = -1;
         s->state = ST_STOPPED;
     }
     fclose(f);
 }
 
-// services handling
+// service management
 static void schedule_restart(svc_t *s) {
     if (s->restarts < s->max_restarts) {
         s->restarts++;
@@ -272,9 +298,105 @@ static void schedule_restart(svc_t *s) {
     }
 }
 
+static int cgroup_ok;
+
+static void cgroup_init(int is_init) {
+    if (is_init) {
+        mkdir("/sys/fs/cgroup", 0755);
+        mount("cgroup2", CGROUP_ROOT, "cgroup2", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
+    }
+    if (mkdir(CGROUP_ROOT "/minit", 0755) < 0 && errno != EEXIST) {
+        fprintf(stderr, "minit: cgroup v2 unavailable (%s), using process group/session kill only\n",
+                strerror(errno));
+        return;
+    }
+    cgroup_ok = 1;
+}
+
+static void kill_cgroup(svc_t *s) {
+    if (!cgroup_ok) return;
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, CGROUP_ROOT "/minit/%s/cgroup.kill", s->name);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t r = write(fd, "1", 1);
+        (void)r;
+        close(fd);
+        return;
+    }
+    snprintf(path, sizeof path, CGROUP_ROOT "/minit/%s/cgroup.procs", s->name);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    int p;
+    while (fscanf(f, "%d", &p) == 1)
+        if (p > 1 && p != getpid()) kill(p, SIGKILL);
+    fclose(f);
+}
+
+static void kill_session(pid_t sid) {
+    DIR *d = opendir("/proc");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        pid_t pid = (pid_t)atoi(e->d_name);
+        if (pid <= 1 || pid == getpid()) continue;
+
+        char path[64], buf[1024];
+        snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        ssize_t n = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (n <= 0) continue;
+        buf[n] = 0;
+
+        char *rp = strrchr(buf, ')');
+        if (!rp) continue;
+        char state;
+        int ppid, pgrp, session;
+        if (sscanf(rp + 1, " %c %d %d %d", &state, &ppid, &pgrp, &session) != 4) continue;
+        if (session == sid) kill(pid, SIGKILL);
+    }
+    closedir(d);
+}
+
+static void kill_group(svc_t *s, pid_t id) {
+    if (id > 1) {
+        kill(-id, SIGKILL);
+        kill_session(id);
+    }
+    kill_cgroup(s);
+}
+
+static void force_kill(svc_t *s) {
+    if (s->pid <= 1) return;
+    log_event(s, "sending SIGKILL to process group %d", (int)s->pid);
+    kill(s->pid, SIGKILL);
+    kill_group(s, s->pid);
+    s->sigkilled = 1;
+    s->kill_at = 0;
+    s->sigkill_at = now_ms();
+    s->kill_retries = 0;
+}
+
+static void begin_stop(svc_t *s) {
+    if (s->pid <= 1 || s->kill_at || s->sigkilled) return;
+    kill(s->pid, SIGTERM);
+    s->kill_at = now_ms() + s->stop_timeout_ms;
+}
+
 static void start_service(svc_t *s) {
     char logpath[PATH_MAX];
     snprintf(logpath, sizeof logpath, LOG_DIR "/%s.log", s->name);
+
+    char cgprocs[PATH_MAX] = "";
+    if (cgroup_ok) {
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof dir, CGROUP_ROOT "/minit/%s", s->name);
+        if (mkdir(dir, 0755) < 0 && errno != EEXIST) perror("minit: mkdir cgroup");
+        snprintf(cgprocs, sizeof cgprocs, CGROUP_ROOT "/minit/%s/cgroup.procs", s->name);
+    }
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -288,6 +410,10 @@ static void start_service(svc_t *s) {
         sigprocmask(SIG_SETMASK, &empty, NULL);
         signal(SIGPIPE, SIG_DFL);
         setsid();
+        if (cgprocs[0]) {
+            int cf = open(cgprocs, O_WRONLY);
+            if (cf >= 0) { ssize_t r = write(cf, "0", 1); (void)r; close(cf); }
+        }
 
         int in = open("/dev/null", O_RDONLY);
         int out = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -301,6 +427,8 @@ static void start_service(svc_t *s) {
     s->pid = pid;
     s->state = ST_RUNNING;
     s->started = now_ms();
+    s->kill_at = 0;
+    s->sigkilled = 0;
     log_event(s, "started pid %d", pid);
 }
 
@@ -314,15 +442,20 @@ static void handle_exit(pid_t pid, int status) {
 
     s->pid = 0;
     s->last_status = status;
+    s->kill_at = 0;
+    s->sigkilled = 0;
 
     if (s->want_restart) {
+        kill_group(s, pid);
         s->want_restart = 0;
         s->restarts = 0;
         start_service(s);
     } else if (!s->wanted) {
+        kill_group(s, pid);
         s->state = ST_STOPPED;
     } else {
         schedule_restart(s);
+        if (s->state == ST_BACKOFF) kill_group(s, pid);
     }
 }
 
@@ -340,8 +473,11 @@ static void reap(int sigfd) {
 static void print_status(int fd, svc_t *s) {
     char last[32], up[32] = "";
     fmt_status(last, sizeof last, s->last_status);
-    if (s->state == ST_RUNNING)
-        snprintf(up, sizeof up, " up=%llds", (now_ms() - s->started) / 1000);
+    if (s->state == ST_RUNNING) {
+        if (s->sigkilled)      snprintf(up, sizeof up, " (killing)");
+        else if (s->kill_at)   snprintf(up, sizeof up, " (stopping)");
+        else snprintf(up, sizeof up, " up=%llds", (now_ms() - s->started) / 1000);
+    }
     dprintf(fd, "%-16s %-8s pid=%-6d restarts=%d/%d last=%s%s\n",
             s->name, state_names[s->state], (int)s->pid,
             s->restarts, s->max_restarts, last, up);
@@ -392,14 +528,20 @@ static void handle_client(int fd) {
     } else if (strcmp(cmd, "stop") == 0) {
         s->wanted = 0;
         s->want_restart = 0;
-        if (s->pid > 0) kill(s->pid, SIGTERM);
+        if (s->pid > 0) begin_stop(s);
         else s->state = ST_STOPPED;
         dprintf(fd, "stopping %s\n", s->name);
+    } else if (strcmp(cmd, "kill") == 0) {
+        s->wanted = 0;
+        s->want_restart = 0;
+        if (s->pid > 0) force_kill(s);
+        else s->state = ST_STOPPED;
+        dprintf(fd, "killing %s\n", s->name);
     } else if (strcmp(cmd, "restart") == 0) {
         if (s->pid > 0) {
             s->wanted = 1;
             s->want_restart = 1;
-            kill(s->pid, SIGTERM);
+            begin_stop(s);
         } else {
             cmd_start(s);
         }
@@ -418,10 +560,12 @@ static int make_socket(void) {
     unlink(SOCK_PATH);
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0)
         panic("bind %s: %s", SOCK_PATH, strerror(errno));
-    chmod(SOCK_PATH, 0600);
+    chmod(SOCK_PATH, 0600);  /* только root */
     if (listen(fd, 8) < 0) panic("listen: %s", strerror(errno));
     return fd;
 }
+
+// main
 
 int main(void) {
     int is_init = (getpid() == 1);
@@ -431,6 +575,7 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
     if (is_init) mount_fs();
+    cgroup_init(is_init);
     mkdir("/var", 0755);
     mkdir("/var/log", 0755);
     mkdir(LOG_DIR, 0755);
@@ -455,8 +600,13 @@ int main(void) {
         long long now = now_ms();
         int timeout = -1;
         for (int i = 0; i < nsvc; i++) {
-            if (svcs[i].state != ST_BACKOFF) continue;
-            long long d = svcs[i].restart_at - now;
+            svc_t *s = &svcs[i];
+            long long at = 0;
+            if (s->state == ST_BACKOFF) at = s->restart_at;
+            else if (s->pid > 0 && s->kill_at) at = s->kill_at;
+            else if (s->pid > 0 && s->sigkilled) at = s->sigkill_at + KILL_RETRY_MS;
+            else continue;
+            long long d = at - now;
             if (d < 0) d = 0;
             if (timeout < 0 || d < timeout) timeout = (int)d;
         }
@@ -472,8 +622,20 @@ int main(void) {
         }
 
         now = now_ms();
-        for (int i = 0; i < nsvc; i++)
-            if (svcs[i].state == ST_BACKOFF && svcs[i].restart_at <= now)
-                start_service(&svcs[i]);
+        for (int i = 0; i < nsvc; i++) {
+            svc_t *s = &svcs[i];
+            if (s->state == ST_BACKOFF && s->restart_at <= now) {
+                start_service(s);
+            } else if (s->pid > 0 && s->kill_at && s->kill_at <= now) {
+                log_event(s, "still alive %d ms after SIGTERM", s->stop_timeout_ms);
+                force_kill(s);
+            } else if (s->pid > 0 && s->sigkilled && s->sigkill_at + KILL_RETRY_MS <= now) {
+                kill(s->pid, SIGKILL);
+                kill_group(s, s->pid);
+                s->sigkill_at = now;
+                if (++s->kill_retries == 5)
+                    log_event(s, "pid %d survives SIGKILL (uninterruptible sleep / D state?)", (int)s->pid);
+            }
+        }
     }
 }

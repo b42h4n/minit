@@ -14,7 +14,7 @@
 static void usage(void) {
     fprintf(stderr,
         "usage: minitctl status [name]\n"
-        "       minitctl start|stop|restart <name>\n"
+        "       minitctl start|stop|restart|kill <name>\n"
         "       minitctl log <name> [lines]   (default 50)\n");
     exit(2);
 }
@@ -92,7 +92,8 @@ int main(int argc, char **argv) {
         snprintf(line, sizeof line, argc > 2 ? "status %s" : "status", argc > 2 ? argv[2] : "");
         return send_cmd(line);
     }
-    if (!strcmp(cmd, "start") || !strcmp(cmd, "stop") || !strcmp(cmd, "restart")) {
+    if (!strcmp(cmd, "start") || !strcmp(cmd, "stop") || !strcmp(cmd, "restart") ||
+        !strcmp(cmd, "kill")) {
         if (argc < 3) usage();
         char line[300];
         snprintf(line, sizeof line, "%s %s", cmd, argv[2]);

@@ -16,14 +16,27 @@ On startup, minit:
 
 1. Warns (but doesn't refuse) if it isn't running as PID 1
 2. Sets a default `PATH` if the environment doesn't provide one
-3. Mounts `/dev` (`devtmpfs`, falling back to `tmpfs` with a minimal set of device nodes), `/dev/pts`, `/dev/shm`, `/proc`, `/sys` and a `tmpfs` on `/run`
+3. Mounts `/dev` (`devtmpfs`, falling back to `tmpfs` with a minimal set of device nodes), `/dev/pts`, `/dev/shm`, `/proc`, `/sys`, `cgroup2` on `/sys/fs/cgroup` and a `tmpfs` on `/run`
 4. Creates `/var/log/minit`
 5. Reads `/etc/minit.conf`. **If the file can't be opened, minit panics** (prints the reason and exits; as PID 1 this triggers a kernel panic)
 6. Starts every service from the config (`fork()` + `execvp()`, arguments and `PATH` lookup supported), each in its own session with stdout/stderr redirected to its log file
 7. Enters an event loop (`signalfd` + `poll`) that:
    - reaps every child, including orphans re-parented to PID 1
    - restarts services that exited, up to their configured limit
+   - escalates `SIGTERM` to `SIGKILL` for services that refuse to stop
    - serves `minitctl` requests on a UNIX socket
+
+## Project layout
+
+```
+minit/
+├── src/
+│   ├── minit.c      # the init daemon (PID 1)
+│   ├── minit.h      # shared paths: config, socket, logs, cgroup root
+│   └── minitctl.c   # control CLI
+├── LICENSE
+└── README.md
+```
 
 ## Building
 
@@ -39,15 +52,15 @@ gcc -O2 -Wall -o src/minitctl minitctl.c
 ### Static build
 
 ```bash
-gcc -static -O2 -Wall -o src/minit minit.c
-gcc -static -O2 -Wall -o src/minitctl minitctl.c
+gcc -static -O2 -Wall -o minit minit.c
+gcc -static -O2 -Wall -o minitctl minitctl.c
 ```
 
 For a truly static binary with no runtime NSS/dlopen surprises, build against musl instead of glibc:
 
 ```bash
-musl-gcc -static -O2 -o src/minit minit.c
-musl-gcc -static -O2 -o src/minitctl minitctl.c
+musl-gcc -static -O2 -o minit minit.c
+musl-gcc -static -O2 -o minitctl minitctl.c
 ```
 
 Strip them down for size if needed:
@@ -56,7 +69,7 @@ Strip them down for size if needed:
 strip --strip-all minit minitctl
 ```
 
-Paths (config file, socket, log directory) are defined in `minit.h` and can be overridden at compile time, e.g. `-DCONF_PATH='"/etc/my.conf"'`.
+Paths (config file, socket, log directory, cgroup root) are defined in `src/minit.h` and can be overridden at compile time, e.g. `-DCONF_PATH='"/etc/my.conf"'`.
 
 ## Configuration
 
@@ -74,6 +87,7 @@ The config is a **single plain-text file**:
 - Blank lines are ignored
 - Lines starting with `#` are comments
 - `restarts = N` sets how many times a service is restarted after it exits. It applies to every service **below** that line and can be changed again further down (default is `0`, i.e. never restart)
+- `stop_timeout = N` sets how many seconds a service gets between `SIGTERM` and `SIGKILL` (default `5`). Like `restarts`, it applies to every service **below** that line
 - An optional `name:` prefix gives the service a name for `minitctl` and for its log file. Without it, the name is the basename of the command; duplicates get a `-2`, `-3`, ... suffix
 
 Example `/etc/minit.conf`:
@@ -81,6 +95,7 @@ Example `/etc/minit.conf`:
 ```
 # Restart these up to 3 times if they die
 restarts = 3
+stop_timeout = 10
 syslogd
 getty1: getty -L tty1 115200 vt100
 
@@ -111,10 +126,11 @@ Logs are never rotated or truncated. Point `/var/log` at a `tmpfs` if the root f
 ## minitctl
 
 ```
-minitctl status [name]
+minitctl status <name>
 minitctl start   <name>
 minitctl stop    <name>
 minitctl restart <name>
+minitctl kill    <name>     # immediate SIGKILL, no grace period
 minitctl log     <name> [lines]     # default: 50
 ```
 
@@ -127,9 +143,27 @@ getty1           running  pid=42     restarts=1/3 last=signal 9 up=17s
 network          stopped  pid=0      restarts=0/0 last=exit 0
 ```
 
+While a service is shutting down, `status` shows `(stopping)` (waiting for `SIGTERM` to work) or `(killing)` (`SIGKILL` sent).
+
 States: `running`, `backoff` (waiting to be restarted), `stopped`, `failed` (restart limit reached).
 
 `minitctl` talks to minit over `/run/minit.sock` (mode `0600`, root only). `log` reads the log file directly.
+
+## Stopping and killing
+
+`stop` and `restart` first send `SIGTERM` to the service's main process. If it is still alive after `stop_timeout` seconds, minit sends `SIGKILL` and keeps re-sending it every second until the process is gone. `minitctl kill` skips the grace period.
+
+`SIGKILL` is not sent only to the main process, it takes down everything the service started:
+
+1. the whole process group (every service runs in its own session via `setsid()`)
+2. every process in the same session, found via `/proc` (catches children that called `setpgid()`)
+3. every process in the service's **cgroup v2** (`/sys/fs/cgroup/minit/<name>`), which catches children that escaped via `setsid()` or a double fork. On kernels >= 5.14 this uses `cgroup.kill`, on older ones minit walks `cgroup.procs`
+
+The same cleanup runs when a service's main process dies and the service is about to be restarted or stopped, so leftover children don't pile up as duplicates.
+
+If cgroup v2 is unavailable (no `CONFIG_CGROUPS`, or the mount fails), minit prints a warning and relies on steps 1 and 2 only.
+
+A process stuck in uninterruptible sleep (`D` state, typically hung I/O) cannot be killed by anyone, including PID 1, until the kernel call returns. minit keeps retrying and logs `survives SIGKILL` after about 5 seconds.
 
 ## Installing as PID 1
 
@@ -139,14 +173,16 @@ Point the kernel at the compiled binary via a kernel command-line parameter:
 init=/sbin/minit
 ```
 
-Install `minitctl` anywhere in `PATH` (e.g. `/sbin/minitctl`). Make sure the binaries and everything minit launches are reachable at boot. minit mounts `/dev`, `/proc`, `/sys` and `/run` itself, but does **not** mount `/` or anything else, so your root filesystem and any other mounts need to already be in place (e.g. handled by an initramfs) before minit runs.
+Install `minitctl` anywhere in `PATH` (e.g. `/sbin/minitctl`). Make sure the binaries and everything minit launches are reachable at boot. minit mounts `/dev`, `/proc`, `/sys`, `/sys/fs/cgroup` and `/run` itself, but does **not** mount `/` or anything else, so your root filesystem and any other mounts need to already be in place (e.g. handled by an initramfs) before minit runs.
 
 `/dev` requires `CONFIG_DEVTMPFS` in the kernel for a full device tree. Without it, minit falls back to a `tmpfs` with only `null`, `zero`, `full`, `random`, `urandom`, `tty` and `console`; you would need `mdev`/`udev` or extra `mknod` calls for anything else.
 
 ## Known limitations
 
 - **No shutdown/reboot handling**: minit does not react to `SIGTERM`/`SIGINT`/`SIGUSR1`, and there is no `poweroff`/`reboot` command
-- **Stopping uses SIGTERM only**: a service that ignores it will not be killed (no SIGKILL escalation)
+- **Only the main process gets `SIGTERM`**: children are only touched by `SIGKILL`
+- **Processes in `D` state can't be killed**, only retried
+- **Synchronous control socket**: each `minitctl` request is handled inline with a 1 second I/O timeout
 
 ## Contributing
 
